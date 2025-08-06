@@ -91,10 +91,8 @@ class VideoReceiver:
         self.current_gun_status = False
         self.gun_confidence = 0.0
         self.gun_objects = []
-        self.gun_detection_interval = 5  # Check every 5 frames
-        self.frame_count_since_last_gun_check = 0
         self.last_gun_api_call_time = 0  # Track time of last gun API call
-        self.gun_api_time_interval = 5.0  # Limit gun API calls to once per 5 seconds
+        self.gun_api_time_interval = 2.0  # Limit gun API calls to once per 2 seconds
         
         # Threading support for NSFW detection
         self.nsfw_detection_queue = queue.Queue(maxsize=1)  # Queue for frames to process
@@ -525,8 +523,8 @@ class VideoReceiver:
             logger.warning("NSFW detection is disabled")
             
         if self.gun_detection_available:
-            print("Gun detection: Active (every 5 frames)")
-            logger.info("Gun detection is active and ready")
+            print(f"Gun detection: Active (every {self.gun_api_time_interval} seconds)")
+            logger.info(f"Gun detection is active and ready (API calls every {self.gun_api_time_interval} seconds)")
         else:
             print("Gun detection: Disabled")
             logger.warning("Gun detection is disabled")
@@ -574,15 +572,13 @@ class VideoReceiver:
                             else:
                                 print(f"SFW - Confidence: {self.nsfw_confidence:.2f}")
                         
-                        # Check for guns/weapons every 5 frames
-                        self.frame_count_since_last_gun_check += 1
+                        # Check for guns/weapons based on time interval (not frames)
+                        current_time = time.time()
+                        time_since_last_call = current_time - self.last_gun_api_call_time
                         
-                        if self.gun_detection_available and (self.frame_count_since_last_gun_check >= self.gun_detection_interval):
-                            logger.info(f"Checking frame #{frame_count} for weapons (checking every {self.gun_detection_interval} frames)...")
+                        if self.gun_detection_available and (time_since_last_call >= self.gun_api_time_interval):
+                            logger.info(f"Checking frame #{frame_count} for weapons (time since last check: {time_since_last_call:.1f}s)...")
                             self.current_gun_status, self.gun_confidence, self.gun_objects = self.check_guns(frame)
-                            
-                            # Reset counter
-                            self.frame_count_since_last_gun_check = 0
                             
                             if self.current_gun_status:
                                 print(f"WEAPON detected! Confidence: {self.gun_confidence:.2f}")
@@ -591,7 +587,8 @@ class VideoReceiver:
                         else:
                             # If not checking this frame, still show status from previous check
                             if self.gun_detection_available:
-                                logger.info(f"Skipping weapon detection on frame #{frame_count} (next check in {self.gun_detection_interval - self.frame_count_since_last_gun_check} frames)")
+                                time_remaining = max(0, self.gun_api_time_interval - time_since_last_call)
+                                logger.info(f"Skipping weapon detection on frame #{frame_count} (next check in {time_remaining:.1f}s)")
                                 if self.current_gun_status:
                                     print(f"WEAPON detected! Confidence: {self.gun_confidence:.2f}")
                                 else:
