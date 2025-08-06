@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+env/
+venv/
+enviroment/
+*.mp4
+*.log
+.DS_Store
+Thumbs.db
+check_model_cache.py
+test_*.py
