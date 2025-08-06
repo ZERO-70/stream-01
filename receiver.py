@@ -15,6 +15,7 @@ from threading import Lock
 from transformers import pipeline
 from PIL import Image
 from inference_sdk import InferenceHTTPClient
+import subprocess
 
 # Set up logging with UTF-8 encoding for Windows compatibility
 logging.basicConfig(
@@ -28,10 +29,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class VideoReceiver:
-    def __init__(self, host='localhost', port=9999):
+    def __init__(self, host='localhost', port=9999, audio_port=9998):
         self.host = host
         self.port = port
+        self.audio_port = audio_port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        # Audio socket and settings
+        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.audio_playing = False
+        self.audio_process = None  # FFplay process for audio playback
         
         # Initialize NSFW detection with detailed logging
         logger.info("Initializing NSFW detection model...")
@@ -78,8 +85,8 @@ class VideoReceiver:
         
         # NSFW detection settings
         self.last_nsfw_check_time = time.time()
-        self.nsfw_time_interval = 0.333  # Check 3 times per second (every 0.333 seconds)
-        self.nsfw_model_interval = 3.0  # Model inference limited to once per 3 seconds
+        self.nsfw_time_interval = 0.5  # Check every 0.5 seconds
+        self.nsfw_model_interval = 0.5  # Model inference every 0.5 seconds (same as check interval)
         self.last_nsfw_model_time = 0
         self.current_nsfw_status = False
         self.nsfw_confidence = 0.0
@@ -121,11 +128,24 @@ class VideoReceiver:
             logger.info("Started gun detection in background thread")
         
     def connect_to_server(self):
-        """Connect to the video streaming server"""
+        """Connect to the video and audio streaming servers"""
         try:
-            logger.info(f"Connecting to {self.host}:{self.port}...")
+            # Connect to video stream
+            logger.info(f"Connecting to video server at {self.host}:{self.port}...")
             self.socket.connect((self.host, self.port))
-            logger.info("Connected to server!")
+            logger.info("Connected to video server!")
+            
+            # Connect to audio stream
+            logger.info(f"Connecting to audio server at {self.host}:{self.audio_port}...")
+            self.audio_socket.connect((self.host, self.audio_port))
+            logger.info("Connected to audio server!")
+            
+            # Start audio playback thread
+            self.audio_playing = True
+            self.audio_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+            self.audio_thread.start()
+            logger.info("Started audio playback thread")
+            
             return True
         except Exception as e:
             logger.error(f"Error connecting to server: {e}")
@@ -146,21 +166,10 @@ class VideoReceiver:
                     # No frame to process, continue waiting
                     continue
                 
-                # Check if we need to limit model inference (once per 3 seconds)
-                current_time = time.time()
-                time_since_last_model = current_time - self.last_nsfw_model_time
-                
-                if time_since_last_model < self.nsfw_model_interval:
-                    logger.info(f"Skipping NSFW model inference - too soon since last inference ({time_since_last_model:.1f}s < {self.nsfw_model_interval}s)")
-                    # Mark task as done and continue
-                    self.nsfw_detection_queue.task_done()
-                    # Add short sleep to prevent CPU spinning
-                    time.sleep(0.1)
-                    continue
-                
                 # Process the frame (NSFW detection)
-                logger.info("Background thread processing NSFW detection")
-                self.last_nsfw_model_time = current_time
+                # The time check is now done in check_nsfw, so we only get frames when we're ready to process
+                logger.info("Processing NSFW detection")
+                self.last_nsfw_model_time = time.time()
                 nsfw_status, confidence = self._process_nsfw_detection(frame)
                 
                 # Update the results with thread safety
@@ -168,13 +177,104 @@ class VideoReceiver:
                     self.current_nsfw_status = nsfw_status
                     self.nsfw_confidence = confidence
                 
-                logger.info(f"Background NSFW detection completed: detected={nsfw_status}, confidence={confidence:.2f}")
+                logger.info(f"NSFW detection completed: detected={nsfw_status}, confidence={confidence:.2f}")
                 
                 # Mark task as done
                 self.nsfw_detection_queue.task_done()
                 
             except Exception as e:
                 logger.error(f"Error in NSFW detection thread: {e}")
+    
+    def _audio_playback_worker(self):
+        """Background worker thread for audio playback using FFplay"""
+        logger.info("Audio playback thread started")
+        
+        try:
+            # Receive audio parameters
+            audio_params_size = struct.unpack("L", self.audio_socket.recv(struct.calcsize("L")))[0]
+            audio_params_data = b""
+            while len(audio_params_data) < audio_params_size:
+                audio_params_data += self.audio_socket.recv(4096)
+            
+            audio_params = pickle.loads(audio_params_data)
+            logger.info(f"Received audio parameters: {audio_params}")
+            
+            # Create a temporary audio file for FFplay
+            temp_audio_file = 'temp_playback.raw'
+            
+            # Start FFplay process for real-time audio playback
+            ffplay_cmd = [
+                'ffplay', '-nodisp', '-autoexit',
+                '-f', 's16le',  # 16-bit signed little-endian
+                '-ac', str(audio_params['channels']),  # channels
+                '-ar', str(audio_params['rate']),      # sample rate
+                '-'  # read from stdin
+            ]
+            
+            try:
+                self.audio_process = subprocess.Popen(
+                    ffplay_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                
+                # Playback loop
+                while self.audio_playing and self.audio_process.poll() is None:
+                    try:
+                        # Get audio chunk size
+                        chunk_size_data = self.audio_socket.recv(struct.calcsize("L"))
+                        if not chunk_size_data:
+                            logger.error("Lost connection to audio server")
+                            break
+                        
+                        chunk_size = struct.unpack("L", chunk_size_data)[0]
+                        
+                        # Receive audio data
+                        audio_data = b""
+                        while len(audio_data) < chunk_size:
+                            packet = self.audio_socket.recv(min(chunk_size - len(audio_data), 4096))
+                            if not packet:
+                                break
+                            audio_data += packet
+                        
+                        # Send audio data to FFplay
+                        if len(audio_data) == chunk_size and self.audio_process.stdin:
+                            self.audio_process.stdin.write(audio_data)
+                            self.audio_process.stdin.flush()
+                        
+                    except Exception as e:
+                        logger.error(f"Error during audio playback: {e}")
+                        break
+                
+            except FileNotFoundError:
+                logger.warning("FFplay not found. Audio playback disabled. Install FFmpeg for audio support.")
+                # Fallback: just consume audio data without playing
+                while self.audio_playing:
+                    try:
+                        chunk_size_data = self.audio_socket.recv(struct.calcsize("L"))
+                        if not chunk_size_data:
+                            break
+                        chunk_size = struct.unpack("L", chunk_size_data)[0]
+                        audio_data = b""
+                        while len(audio_data) < chunk_size:
+                            packet = self.audio_socket.recv(min(chunk_size - len(audio_data), 4096))
+                            if not packet:
+                                break
+                            audio_data += packet
+                    except:
+                        break
+            
+            # Cleanup
+            if self.audio_process and self.audio_process.stdin:
+                self.audio_process.stdin.close()
+            if self.audio_process:
+                self.audio_process.terminate()
+                
+        except Exception as e:
+            logger.error(f"Error in audio playback thread: {e}")
+        
+        logger.info("Audio playback thread stopped")
     
     def _gun_detection_worker(self):
         """Background worker thread for gun detection processing"""
@@ -367,35 +467,36 @@ class VideoReceiver:
             return False, 0.0, []
     
     def check_nsfw(self, frame):
-        """Queue a frame for NSFW detection in the background thread"""
+        """Check if we should process a frame for NSFW detection in the background thread"""
         if not self.nsfw_detection_available:
             return False, 0.0
             
-        # Check if it's time to queue a new detection (3 times per second)
+        # Check if it's time to process a new detection (every 0.5 seconds)
         current_time = time.time()
-        time_since_last_check = current_time - self.last_nsfw_check_time
+        time_since_last_check = current_time - self.last_nsfw_model_time
         
-        if time_since_last_check >= self.nsfw_time_interval:
+        if time_since_last_check >= self.nsfw_model_interval:
             self.last_nsfw_check_time = current_time
             self.frame_count_since_last_nsfw_check = 0
             
-            # Don't block on the queue - if it's full, skip this frame
+            # We're ready to detect, so process the frame
             try:
                 # Make a deep copy of the frame to avoid issues with shared memory
                 frame_copy = frame.copy()
                 
-                # Try to put the frame in the queue without blocking
+                # Put the frame in the queue without blocking - only if we're ready to detect
                 if self.nsfw_detection_queue.qsize() == 0:
                     self.nsfw_detection_queue.put_nowait(frame_copy)
-                    logger.info(f"Queued frame for background NSFW detection")
+                    logger.info(f"Processing frame for NSFW detection (time since last: {time_since_last_check:.2f}s)")
                 else:
-                    logger.info(f"Skipped queueing frame - background NSFW detection still in progress")
+                    logger.info(f"Skipped processing - previous NSFW detection still in progress")
             except queue.Full:
-                logger.info(f"Skipped queueing frame - NSFW queue is full")
+                logger.info(f"Skipped processing - NSFW queue is full")
                 
         else:
-            # Count frames since last check (but don't display it)
+            # Not enough time has passed since last detection
             self.frame_count_since_last_nsfw_check += 1
+            logger.info(f"Skipping NSFW detection - next check in {self.nsfw_model_interval - time_since_last_check:.2f}s")
         
         # Return the current results (from the thread)
         with self.nsfw_results_lock:
@@ -512,12 +613,20 @@ class VideoReceiver:
         data = b""
         payload_size = struct.calcsize("L")
         
+        # Set up display window with resizable property
+        cv2.namedWindow('Video Stream', cv2.WINDOW_NORMAL)
+        
+        # Set initial window size for better display on laptop
+        initial_width = 960  # Standard laptop width
+        initial_height = 720  # Height maintaining aspect ratio
+        cv2.resizeWindow('Video Stream', initial_width, initial_height)
+        
         logger.info("Starting video stream reception...")
         print("Receiving video stream...")
         print("Press 'q' to quit")
         if self.nsfw_detection_available:
-            print("NSFW detection: Active (3 checks/sec, model inference every 3 sec)")
-            logger.info("NSFW detection is active and ready")
+            print(f"NSFW detection: Active (every {self.nsfw_model_interval} sec)")
+            logger.info(f"NSFW detection is active and ready (every {self.nsfw_model_interval} sec)")
         else:
             print("NSFW detection: Disabled")
             logger.warning("NSFW detection is disabled")
@@ -642,8 +751,15 @@ class VideoReceiver:
                             cv2.putText(frame, "Weapon Detection: Disabled", (10, y_pos), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (128, 128, 128), 2)
                         
-                        # Display frame
-                        cv2.imshow('Video Stream', frame)
+                        # Resize frame to fit better on laptop screens
+                        # Use a scale factor to make the window smaller
+                        scale_factor = 0.9  # Reduce to 90% of original size
+                        display_width = int(frame.shape[1] * scale_factor)
+                        display_height = int(frame.shape[0] * scale_factor)
+                        display_frame = cv2.resize(frame, (display_width, display_height))
+                        
+                        # Display resized frame
+                        cv2.imshow('Video Stream', display_frame)
                         
                         # Maintain consistent frame rate (similar to original video)
                         # Calculate how long to wait before next frame
@@ -706,8 +822,32 @@ class VideoReceiver:
                     logger.info("Gun detection thread stopped" if not self.gun_detection_thread.is_alive() 
                               else "Gun detection thread timeout - continuing cleanup")
             
+            # Stop the audio playback thread if it's running
+            if self.audio_playing:
+                logger.info("Stopping audio playback thread...")
+                self.audio_playing = False
+                
+                # Terminate audio process if running
+                if self.audio_process:
+                    try:
+                        if self.audio_process.stdin:
+                            self.audio_process.stdin.close()
+                        self.audio_process.terminate()
+                        self.audio_process.wait(timeout=2.0)
+                        logger.info("Audio process terminated")
+                    except:
+                        self.audio_process.kill()
+                        logger.info("Audio process killed")
+                
+                # Wait for the thread to finish (with timeout)
+                if hasattr(self, 'audio_thread') and self.audio_thread.is_alive():
+                    self.audio_thread.join(timeout=2.0)
+                    logger.info("Audio playback thread stopped" if not self.audio_thread.is_alive() 
+                              else "Audio playback thread timeout - continuing cleanup")
+            
             cv2.destroyAllWindows()
             self.socket.close()
+            self.audio_socket.close()
             logger.info("Receiver closed successfully")
             print("Receiver closed")
         except Exception as e:
