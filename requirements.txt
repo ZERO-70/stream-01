@@ -1,0 +1,7 @@
+opencv-python==4.8.1.78
+numpy<2.0.0
+transformers>=4.30.0
+torch>=2.0.0
+Pillow>=9.0.0
+setuptools>=65.5.0
+inference-sdk>=0.0.2
